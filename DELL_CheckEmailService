@@ -1,0 +1,708 @@
+'Perot_CheckEmailService is a Windows Service to download email files from
+'MS Outlook Inbox to Fileserver, or local directory. This service saves   
+'downloaded email information in Imaging-ImailImported database and creates  
+'email import Xml file.
+'
+'Main recourses for application are:
+'1. AppPortal recourses to get main connection string to Imaging-ImailImported db;
+'2. app.config recourses to get Outlook Inbox access, Save files directories.
+'
+'Service Components: Perot.CommonSuite, Perot.ImagingSuite, Perot_ExchangeEmail 
+'Perot_ExchangeEmail - Library project gets email from the Inbox 
+
+'SUPPORTED Import Methods
+'
+
+Imports DELL.ExchangeEmail.ExchangeServer
+Imports DELL.ExchangeEmail.Objects
+Imports System.Configuration.ConfigurationManager
+Imports System.IO
+Imports System.Data.SqlClient
+Imports System.Xml
+Imports System.Net.Mail
+Imports System.Threading.Tasks
+Imports Microsoft.Identity.Client
+Imports Microsoft.Exchange.WebServices.Data
+Imports Task = System.Threading.Tasks.Task
+Imports System.Net
+
+Public Class DELL_CheckEmailService
+
+
+    Dim SupportedDocumentTypes As New List(Of String)
+    Dim sleepTime As Integer = (60000) * 1 'Default Cycle Time
+    Dim sCompanyNumber As String
+    Dim sAppShortName As String
+    Dim sEmailTo As String = Nothing
+    Dim EmailSubjectFilters As New List(Of String)
+    Dim sbErrorLog As Text.StringBuilder
+    Dim ImagingObjectMgr As Perot.ObjectManagers.Imaging.ImagingObjManager
+    Dim EmailObjectManager As DELL.ExchangeEmail.EmailServiceObjectManager
+    Dim ProcessedEmailObjectsInError As New Hashtable
+    Dim NextWaitPeriod As Integer
+    Dim ErrorManager As EmailSettingManagerList
+    Dim ServiceSuspendedNotificationTime As Date
+
+    Dim othread As System.Threading.Thread
+    Dim IsExiting As Boolean = False
+
+    Dim EmailSettings As DELL.ExchangeEmail.Objects.EmailSettings
+
+    Protected Overrides Sub OnStop()
+        IsExiting = True
+    End Sub
+
+    Protected Overrides Async Sub OnStart(ByVal args() As String)
+        Try
+            IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Initializing")
+            Call Initialize()
+        Catch ex As Exception
+            IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "FatalStart.txt"), Now & vbCrLf & ex.ToString)
+            End
+        End Try
+    End Sub
+
+
+
+
+
+    Public Sub Initialize()
+
+
+        othread = New System.Threading.Thread(AddressOf DownloadEmailProcessAsync)
+
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Initializing Suspended Notification Date")
+        ServiceSuspendedNotificationTime = Now.AddDays(-1)
+
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Initializing Email Service Object Manager")
+        EmailObjectManager = New DELL.ExchangeEmail.EmailServiceObjectManager
+
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Initializing Email Setting Manager")
+        ErrorManager = New EmailSettingManagerList
+
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Dynamic PDF License")
+        ceTe.DynamicPDF.Document.AddLicense("DPS70NPDMKCANKWYAt7l97bigNgRPYS4FEo05qLAHLMLvtddQ8Q87p9IjkSsflJrQ9XagKG5fhrlPx6LaAt3RFqKUKd+wVZ2Tosw")
+
+        'Load the supported document types, includes all document types
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Getting AppShortName")
+        sAppShortName = AppSettings("AppShortName")
+        IO.File.WriteAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Getting SleepTime")
+        If AppSettings("SleepTimeInMinutes") Is Nothing Then
+            sleepTime = 60000 * 1
+        Else
+            sleepTime = Val(AppSettings("SleepTimeInMinutes")) * 60000
+        End If
+        If sleepTime = 0 Then sleepTime = 60000 * 1
+
+        'If Not EventLog.SourceExists(ServiceName) Then
+        '    EventLog.CreateEventSource(ServiceName, "Application")
+        'End If
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Getting Error Info")
+        sEmailTo = AppSettings("EmailErrorsTo")
+
+        'If you are planning on making the service process more email accounts at once, comment the following line.
+        'each child thread spawned MUST be have an appartment state of STA for the service to process the emails properly.  
+        'The parent must be MTA.  This is due to the activeX module loaded within the HTML convertor.
+        IO.File.AppendAllText(IO.Path.Combine(My.Application.Info.DirectoryPath, "StartLog.txt"), Now & vbCrLf & "Starting Thread")
+        othread.SetApartmentState(Threading.ApartmentState.STA)
+        othread.Start()
+    End Sub
+
+
+    Public Async Function DownloadEmailProcessAsync() As Task
+        Dim LastDeleteDate As Date = DateTime.Now.AddDays(-2)
+        Dim LastSentDisabledNotice As Date = DateTime.Now.AddDays(-2)
+
+        ' Constants
+        Const ClientId As String = "3a576d23-d898-4f11-a3e9-9a1b98c4a4c7"
+        Const TenantId As String = "65e4e06f-f263-4c1f-becb-90deb8c2d9ff"
+        Const ClientSecret As String = "EjR8Q~kLrCWaYE7MtTam03FdpwVhaXFF3tayia3A"
+        Const EmailServer As String = "https://outlook.office365.com/EWS/Exchange.asmx"
+        Const ServiceAccountEmail As String = "servicemoemail.svc@nttdata.com"
+
+        While Not IsExiting
+            Try
+                If GetResources() Then
+                    ' Acquire token
+                    Dim app As IConfidentialClientApplication = ConfidentialClientApplicationBuilder.Create(ClientId).
+                        WithClientSecret(ClientSecret).
+                        WithAuthority(AzureCloudInstance.AzurePublic, TenantId).
+                        Build()
+
+                    Dim scopes As String() = New String() {"https://graph.microsoft.com/.default"}
+
+                    Dim result As AuthenticationResult = Await app.AcquireTokenForClient(scopes).ExecuteAsync()
+
+                    ' Initialize EWS
+                    Dim service As New ExchangeService()
+                    service.Url = New Uri(EmailServer)
+                    service.Credentials = New NetworkCredential(ServiceAccountEmail, String.Empty)
+                    service.HttpHeaders.Add("Authorization", "Bearer " + result.AccessToken)
+
+                    ' Process emails using EWS
+                    ProcessEmails()
+
+                    ' Delete any old emails from the mailbox
+                    If LastDeleteDate < DateTime.Now.AddDays(-1) Then
+                        ClearInboxes(service)
+                        LastDeleteDate = DateTime.Now
+                    End If
+
+                    ' Send any notifications
+                    If (DateTime.Now - LastSentDisabledNotice).TotalHours > 23 AndAlso DateTime.Now.Hour = 13 Then
+                        SendDisabledNotice()
+                        LastSentDisabledNotice = DateTime.Now
+                    End If
+                End If
+            Catch ex As Exception
+                WriteToEventLog(String.Format("Error{0}{1}", vbCrLf, ex.ToString), EventLogEntryType.Error)
+                SendMail("Error in Dell_CheckEmailService", ex.ToString)
+            End Try
+            If NextWaitPeriod <= 0 Then
+                NextWaitPeriod = sleepTime
+            End If
+            Await Threading.Tasks.Task.Delay(NextWaitPeriod)
+            NextWaitPeriod = 0
+        End While
+    End Function
+
+
+
+    'Public Sub DowloadEmailProcess()
+    '    Dim LastDeleteDate As Date = Now.AddDays(-2)
+    '    Dim LastSentDisabledNotice As Date = Now.AddDays(-2)
+    '    While Not IsExiting
+    '        Try
+    '            If GetResources() Then
+    '                'process emails
+    '                ProcessEmails()
+    '                'delete any old emails from the mailbox.
+    '                If LastDeleteDate < Now.AddDays(-1) Then
+    '                    ClearInboxes(service)
+    '                    LastDeleteDate = Now
+    '                End If
+    '                'send any notifications
+    '                If (Now - LastSentDisabledNotice).TotalHours > 23 And Now.Hour = 13 Then
+    '                    SendDisabledNotice()
+    '                    LastSentDisabledNotice = Now
+    '                End If
+    '            End If
+    '        Catch ex As Exception
+    '            WriteToEventLog(String.Format("Error{0}{1}", vbCrLf, ex.ToString), EventLogEntryType.Error)
+    '            SendMail("Error in Dell_CheckEmailService", ex.ToString)
+    '        End Try
+    '        If NextWaitPeriod <= 0 Then
+    '            NextWaitPeriod = sleepTime
+    '        End If
+    '        Threading.Thread.Sleep(NextWaitPeriod)
+    '        NextWaitPeriod = 0
+    '    End While
+    'End Sub
+
+    Private Sub SendDisabledNotice()
+        Dim disabledEmails As New System.Text.StringBuilder
+        Dim Message As String
+        EmailObjectManager.FormConnectStringAUTO()
+        EmailSettings = EmailObjectManager.LoadAllSettings()
+        EmailSettings = EmailSettings.FindAppDisabledEmailSettings
+        For Each es As EmailSetting In EmailSettings
+            If es.StatusCode = 3 Then
+                disabledEmails.AppendLine(es.EmailAddress)
+            End If
+        Next
+        If disabledEmails.Length > 0 Then
+            Message = "The following email accounts are disabled because the system could not access the email inboxes due to a version error" & vbCrLf & vbCrLf
+            Message &= disabledEmails.ToString
+            Message &= vbCrLf & vbCrLf
+            Message &= "Resolution:" & vbCrLf
+            Message &= "    1.  Contact the DELL helpdesk" & vbCrLf
+            Message &= "    2.  Open a ticket for the Exchange Team." & vbCrLf
+            Message &= "    3.  Have them move the mailbox(s) listed above to an Exchange 2010 server, they're probably configured on a 2007 server." & vbCrLf
+            Message &= "    4.  When resolved, goto the Email Service Config web site and mark the email account(s) as active." & vbCrLf
+            Message &= vbCrLf
+            Message &= "This message is sent once per day at 1:00 PM and can be disabled by going to the Email Service Config web site and saving the listed email accounts as disabled (this resets the autodisabled flag)." & vbCrLf
+            SendMail("DELL_CheckEmailService Disabled Accounts", Message)
+        End If
+        Message = ""
+        disabledEmails = Nothing
+
+    End Sub
+
+    'cleans the email inboxes.
+
+    Private Sub ClearInboxes(service As ExchangeService)
+        Dim tEmail As EmailMessage
+        Dim emailErrorManager As EmailSettingManager
+
+        For Each es As EmailSetting In Me.EmailSettings
+            emailErrorManager = ErrorManager.findByEmailAddress(es.EmailAddress)
+            If emailErrorManager Is Nothing Then
+                emailErrorManager = New EmailSettingManager(es.EmailAddress)
+                ErrorManager.Add(emailErrorManager)
+            End If
+
+            Try
+                ' Create a view to retrieve emails
+                Dim itemView As New ItemView(100)
+                itemView.PropertySet = New PropertySet(BasePropertySet.IdOnly, ItemSchema.Subject, ItemSchema.DateTimeReceived, EmailMessageSchema.IsRead)
+
+                ' Find items in the Inbox
+                Dim findResults As FindItemsResults(Of Item) = service.FindItems(WellKnownFolderName.Inbox, itemView)
+
+                For Each item As Item In findResults.Items
+                    tEmail = TryCast(item, EmailMessage)
+
+                    If tEmail IsNot Nothing AndAlso tEmail.IsRead Then
+                        Try
+                            If tEmail.DateTimeReceived < DateTime.Now.AddDays(-14) Then
+                                tEmail.Delete(DeleteMode.HardDelete)
+                                EmailObjectManager.AddLogItem(String.Format("Account={3} - Deleted old email from = [{0}] sent = [{2}] subject = [{1}].", tEmail.From, tEmail.Subject, tEmail.DateTimeReceived, es.EmailAddress))
+                            End If
+                        Catch ex As Exception
+                        End Try
+                    End If
+                Next
+            Catch ex As Exception
+            End Try
+        Next
+    End Sub
+
+    'Private Sub ClearInboxes()
+    '    Dim tEmailReader As New EmailReader
+    '    Dim tEmail As EmailMessage2
+    '    Dim emailErrorManager As EmailSettingManager
+
+    '    For Each es As EmailSetting In Me.EmailSettings
+    '        emailErrorManager = ErrorManager.findByEmailAddress(es.EmailAddress)
+    '        If emailErrorManager Is Nothing Then
+    '            emailErrorManager = New EmailSettingManager(es.EmailAddress)
+    '            ErrorManager.Add(emailErrorManager)
+    '        End If
+
+    '        Try
+    '            tEmailReader.ConnectAndDownloadEmail(es.EmailServer, es.UserName, es.Password, es.Domain, es.EmailAddress, "Inbox", False, 2, False, emailErrorManager.serviceVersion)
+    '            If tEmailReader.WasServiceVersionMisMatch Then
+    '                emailErrorManager.serviceVersion += 1
+    '                If emailErrorManager.serviceVersion > 2 Then
+    '                    emailErrorManager.serviceVersion = 0
+    '                End If
+    '                emailErrorManager.emailVersionErrors += 1
+    '                Continue For
+    '            End If
+    '            For cnt As Integer = 0 To tEmailReader.Messages.Count - 1
+    '                tEmail = tEmailReader.Messages(cnt)
+    '                If tEmail.IsRead = True Then
+    '                    Try
+    '                        If tEmail.DateSent < Now.AddDays(-14) Then
+    '                            tEmailReader.DeleteEmail(tEmail, 10)
+    '                            EmailObjectManager.AddLogItem(String.Format("Account={3} - Deleted old email from = [{0}] sent = [{2}] subject = [{1}].", tEmail.GetFrom, tEmail.GetSubject, tEmail.DateSent, es.EmailAddress))
+    '                        End If
+    '                    Catch ex As Exception
+    '                    End Try
+    '                End If
+    '            Next
+    '        Catch ex As Exception
+    '        End Try
+    '    Next
+    'End Sub
+
+
+    Public Function GetResources() As Boolean
+        EmailObjectManager.FormConnectStringAUTO()
+        EmailSettings = EmailObjectManager.LoadAllSettings()
+        EmailSettings = EmailSettings.FindEnabledEmailSettings
+        Return True
+    End Function
+
+
+    Private Sub ProcessEmails()
+        Try
+            Dim tempLog As New System.Text.StringBuilder("")
+            Dim tEmailReader As New EmailReader
+            Dim tEmailProcessor As EmailProcessor
+            Dim tEmail As EmailMessage2
+            Dim tempSubject As String
+            Dim OkToProcess As Boolean
+            Dim EmailsProcessed As Integer
+            Dim EmailsToDownload As Integer
+            Dim EmailManager As EmailSettingManager
+            Dim emailNotificationsTo As String
+
+            'how many emails to download per email account
+            EmailsToDownload = Val(AppSettings("EmailsToDownload"))
+            If EmailsToDownload = 0 Then
+                EmailsToDownload = 5
+            End If
+            For Each es As EmailSetting In Me.EmailSettings
+
+                EmailManager = ErrorManager.findByEmailAddress(es.EmailAddress)
+                If EmailManager Is Nothing Then
+                    EmailManager = New EmailSettingManager(es.EmailAddress)
+                    EmailManager.serviceLocation = es.EmailServer
+                    ErrorManager.Add(EmailManager)
+                End If
+
+                'decide who is supposed to get general notifications
+                Select Case True
+                    Case String.IsNullOrEmpty(es.ForwardToOnError) And String.IsNullOrEmpty(AppSettings("EmailErrorsTo"))
+                        emailNotificationsTo = Nothing
+                    Case (Not String.IsNullOrEmpty(AppSettings("EmailErrorsTo"))) And (Not String.IsNullOrEmpty(es.ForwardToOnError))
+                        emailNotificationsTo = AppSettings("EmailErrorsTo") & ";" & es.ForwardToOnError
+                    Case (Not String.IsNullOrEmpty(AppSettings("EmailErrorsTo")))
+                        emailNotificationsTo = AppSettings("EmailErrorsTo")
+                    Case Else
+                        emailNotificationsTo = es.ForwardToOnError
+                End Select
+                emailNotificationsTo = ""
+                'this allows the service to be suspended.  There is no current "front end" for this setting.
+                If ImagingObjectMgr IsNot Nothing Then
+                    For Each gar As Perot.AppPortal.Objects.GetAppResourceObject In ImagingObjectMgr.AppPortalSession.Resources
+                        If gar.ResourceType = "SETTING" And gar.ResourceName = "SUSPENDED" Then
+                            If gar.KeyField = "1" Then
+                                If ServiceSuspendedNotificationTime < Now.AddDays(-1) Then
+                                    SendMail("DELL_CheckEmailService Suspended", String.Format("The DELL_CheckEmailService has been manually suspended.{0}{0}Processing will not resume until AppPoral setting (Type='SETTING' Name='SUSPENDED') is set to 0 for Application='{1}'.{0}{0}This notification is sent once per day.", vbCrLf, sAppShortName))
+                                    ServiceSuspendedNotificationTime = Now
+                                End If
+                                Exit Sub
+                            End If
+                        End If
+                    Next
+                End If
+
+                EmailSubjectFilters.Clear()
+
+                Try
+
+                    If EmailManager.suspendedUntil > Now Then
+                        Continue For 'goto the next email address
+                    End If
+
+                    tEmailReader.ConnectAndDownloadEmail(EmailManager.serviceLocation, es.UserName, es.Password, es.Domain, es.EmailAddress, "Inbox", False, EmailsToDownload, EmailManager.serviceVersion)
+
+                    Select Case True
+                        Case tEmailReader.WasConnectionFailure
+
+                            EmailManager.connectivityErrors += 1
+                            If EmailManager.connectivityErrors > 50 Then
+                                EmailManager.suspendedUntil = Now.AddMinutes(30) 'don't allow the email account to be accessed for 30 minutes..
+                                If Not String.IsNullOrEmpty(emailNotificationsTo) Then
+                                    SendMail(emailNotificationsTo, "Error Accessing Email Account", String.Format("ERROR Could not connect to mailbox or download messages after {0} attempts for {1} due to connectivity issues.{2}  This email address will be suspended for 30 minutes.{2}{2}{3}/{4}", EmailManager.connectivityErrors, es.EmailAddress, vbCrLf, My.Application.Info.ProductName, My.Computer.Name))
+                                End If
+                                EmailManager.ResetCounters()
+                            End If
+                            EmailObjectManager.AddLogItem(String.Format("ERROR Could not connect to mailbox or download messages. Mailbox={0}", es.EmailAddress))
+                        Case tEmailReader.WasServiceVersionMisMatch
+
+                            EmailManager.emailVersionErrors += 1
+                            If EmailManager.emailVersionErrors > 60 Then
+                                If Not String.IsNullOrEmpty(emailNotificationsTo) Then
+                                    SendMail(emailNotificationsTo, "Error Processing " & es.EmailAddress, String.Format("ERROR Could not connect to mailbox after {0} attempts for {1} due to a server incompatibility.{2}" &
+                                                                                                                       "This email account has been disabled and will not be processed." &
+                                                                                                                       "  The email account may not have been properly configured on a EWS 2010 server." &
+                                                                                                                       "  It may be re-enabled using the configuration tool at anytime.{2}{2}" &
+                                                                                                                       "  A ticket will have to be opened using the DELL helpdesk.  Tell them that email address [{1}] was not properly configured on an Exchange 2010 mail server when it was setup." &
+                                                                                                                       "  The email account will have to be moved to an Exchange 2010 server before the system can process it." &
+                                                                                                                       "  Ask that the ticket be assigned to the Exchange team and you would like notification when the issue is resolved.{2}{2}{3}/{4}", EmailManager.connectivityErrors, es.EmailAddress, vbCrLf, My.Application.Info.ProductName, My.Computer.Name))
+                                End If
+
+                                es.StatusCode = 3
+                                EmailObjectManager.AddUpdateEmailSetting(es)
+                                EmailManager.ResetCounters()
+                            End If
+                            EmailObjectManager.AddLogItem(String.Format("Email Server Version Error Encountered for {1}.{0}Attempt Number: {3}{0}System will disable account after 60 consecutive attempts.{0}{2}.", vbCrLf, es.EmailAddress, EmailManager.serviceVersion.ToString, EmailManager.emailVersionErrors))
+                        Case tEmailReader.LastRequestWasSuccessful = False
+
+                            If tEmailReader.LastException IsNot Nothing Then
+                                If tEmailReader.LastException.Message.ToLower.Contains("internal server error") Then
+                                    EmailManager.serverErrors += 1
+                                    If EmailManager.serverErrors > 50 Then
+                                        EmailManager.suspendedUntil = Now.AddMinutes(60) 'set the next sleep cycle to an hour if a server error occurs
+
+                                        If Not String.IsNullOrEmpty(emailNotificationsTo) Then
+                                            SendMail(emailNotificationsTo, "Error Processing " & es.EmailAddress, String.Format("ERROR Could not connect to mailbox or download messages for {2} due to an internal server error being reported by the Exchange Server.{0}{0}SUSPENDING for 60 minutes.{0}{0}Processing will resume at {3}.{0}{1}", vbCrLf, tEmailReader.LastException.Message, es.EmailAddress, EmailManager.suspendedUntil))
+                                        End If
+                                        EmailManager.ResetCounters()
+                                    End If
+                                End If
+                                EmailObjectManager.AddLogItem(String.Format("ERROR Could not connect to mailbox or download messages for {2}.{0}{1}", vbCrLf, tEmailReader.LastException.ToString, es.EmailAddress))
+                            End If
+                        Case Else
+
+                            EmailManager.ResetCounters()
+                    End Select
+                Catch ex As Exception
+                    EmailObjectManager.AddLogItem(String.Format("ERROR Could not connect to mailbox or download messages. {2}{0}{1}", vbCrLf, ex.ToString, es.EmailAddress))
+                End Try
+                If tEmailReader.Messages.Count > 0 Then
+                    WriteToEventLog(String.Format("Processing {0} emails for {1}", tEmailReader.Messages.Count, es.AccountName), EventLogEntryType.Information)
+                End If
+                EmailsProcessed = 0
+
+                For cnt As Integer = 0 To tEmailReader.Messages.Count - 1
+                    EmailsProcessed += 1
+                    OkToProcess = True
+                    If IsExiting Then Exit Sub
+                    tEmail = tEmailReader.Messages(cnt)
+
+                    tempSubject = tEmail.EmailMessage.Subject
+                    For Each s As String In EmailSubjectFilters
+                        If tempSubject.ToLower.Contains(s.ToLower) Then
+                            OkToProcess = False 'set flag to remove the email from the exchange server.
+                            Exit For
+                        End If
+                    Next
+                    If Not OkToProcess Then
+                        tEmailReader.DeleteEmail(tEmail, 60)
+                    Else
+                        tEmailProcessor = New EmailProcessor(ImagingObjectMgr, tEmailReader, es)
+                        tEmailProcessor.SupportedDocumentTypes = New List(Of String)
+                        tEmailProcessor.SupportedDocumentTypes.AddRange(es.aSupportedFileTypes)
+                        Try
+                            tEmailProcessor.ProcessTheEmail(tEmail)
+                            If tEmailProcessor.GetLog = "" Then
+                                If ProcessedEmailObjectsInError.ContainsKey(tEmail.EmailMessage.Id.UniqueId) Then
+                                    ProcessedEmailObjectsInError.Remove(tEmail.EmailMessage.Id.UniqueId)
+                                End If
+
+                                If es.MarkEmailsAsReadAfterProcessing Then
+                                    tEmailReader.SetReadFlag(tEmail, True, 60)
+                                End If
+                                tEmailReader.DeleteEmail(tEmail, 60)
+                            Else
+
+                                If tEmailProcessor.DoNotMarkEmailAsRead Then
+                                    tempLog.AppendFormat("{1}{0}{2}{0}", vbCrLf, Now, "Path=" & tEmail.EmailMessage.Subject & vbCrLf & "Mail Account=" & es.AccountName & vbCrLf & tEmailProcessor.GetLog)
+                                Else
+                                    If ProcessedEmailObjectsInError.ContainsKey(tEmail.EmailMessage.Id.UniqueId) Then
+                                        If ProcessedEmailObjectsInError(tEmail.EmailMessage.Id.UniqueId) > 20 Then
+                                            ProcessedEmailObjectsInError.Remove(tEmail.EmailMessage.Id.UniqueId)
+                                            If Not String.IsNullOrEmpty(es.ForwardToOnError) Then
+                                                ForwardEmail(es.ForwardToOnError, "DO NOT REPLY.  An error occured while processing the attached email.  It will be deleted from the inbox.  ID=" & tEmail.EmailMessage.Id.UniqueId, tEmail)
+                                            End If
+                                            tEmailReader.SetReadFlag(tEmail, True, 60)
+                                            tEmailReader.DeleteEmail(tEmail, 60)
+                                        Else
+                                            ProcessedEmailObjectsInError(tEmail.EmailMessage.Id.UniqueId) += 1
+                                        End If
+                                    Else
+                                        ProcessedEmailObjectsInError.Add(tEmail.EmailMessage.Id.UniqueId, 1)
+                                    End If
+                                    tempLog.AppendFormat("{1}{0}{2}{0}", vbCrLf, Now, "Message Flagged Path=" & tEmail.EmailMessage.Subject & vbCrLf & "Mail Account=" & es.AccountName & vbCrLf & tEmailProcessor.GetLog)
+                                End If
+                            End If
+                            tEmail.Dispose()
+                            tEmail = Nothing
+                            GC.Collect()
+                        Catch ex As Exception
+
+                            If ex.Message.ToLower.Contains("object was not found") Then
+
+                            Else
+                                tempLog.AppendFormat("Error Processing Email Subject = ({1}) To({4}) MEM{5}{0}{2}{0}ID={3}", vbCrLf, tEmail.EmailMessage.Subject, ex.ToString, tEmail.EmailMessage.Id.UniqueId, tEmail.GetTo, Process.GetCurrentProcess.PrivateMemorySize64)
+                                Try
+                                    If ProcessedEmailObjectsInError.ContainsKey(tEmail.EmailMessage.Id.UniqueId) Then
+                                        If ProcessedEmailObjectsInError(tEmail.EmailMessage.Id.UniqueId) > 20 Then
+                                            ProcessedEmailObjectsInError.Remove(tEmail.EmailMessage.Id.UniqueId)
+                                            Dim ErrorMessage As String = "DO NOT REPLY.  An error occured while processing the attached email.  There may be system releated issues that caused this failure.  Please try later.  20 attempts to process were made. This email will be deleted from the mailbox." & vbCrLf & vbCrLf & "ERROR:" & vbCrLf & ex.Message
+                                            If es.AutoReplyOnError Then
+                                                If String.IsNullOrEmpty(es.ForwardToOnError) Then
+                                                    ForwardEmail(tEmail.GetFrom, ErrorMessage, tEmail)
+                                                    EmailObjectManager.AddLogItem(String.Format("Replied To Sender.{0}{2} Could not process email.{0}{1} {3}", vbCrLf, ex.ToString, es.ImportMethod, es.EmailAddress))
+                                                Else
+                                                    ForwardEmail(tEmail.GetFrom & ";" & es.ForwardToOnError, ErrorMessage, tEmail)
+                                                    EmailObjectManager.AddLogItem(String.Format("Replied To Sender And Predefined ForwardToOnError Recipient(s).{0}{2} Could not process email.{0}{1} {3}", vbCrLf, ex.ToString, es.ImportMethod, es.EmailAddress))
+                                                End If
+                                            ElseIf Not String.IsNullOrEmpty(es.ForwardToOnError) Then
+                                                ForwardEmail(tEmail.GetFrom & ";" & es.ForwardToOnError, ErrorMessage, tEmail)
+                                                EmailObjectManager.AddLogItem(String.Format("Email Forwarded To Predefined ForwardToOnError Recipient(s). {0} Could not process email.{0}{1} {3}", vbCrLf, ex.ToString, es.ImportMethod, es.EmailAddress))
+                                            Else
+                                                EmailObjectManager.AddLogItem(String.Format("Sender was not notified.{0}{2} Could not process email.{0}{1} ERR2:{0}{3}", New String() {vbCrLf, ex.ToString, es.ImportMethod, es.ToString}))
+                                            End If
+                                            tEmailReader.SetReadFlag(tEmail, True, 60)
+                                            tEmailReader.DeleteEmail(tEmail, 60)
+                                        Else
+                                            ProcessedEmailObjectsInError(tEmail.EmailMessage.Id.UniqueId) += 1
+                                        End If
+                                    Else
+                                        ProcessedEmailObjectsInError.Add(tEmail.EmailMessage.Id.UniqueId, 1)
+                                    End If
+                                Catch
+                                End Try
+                            End If
+                        End Try
+                    End If
+                Next
+            Next
+            If tempLog.ToString <> "" Then
+                EmailObjectManager.AddLogItem(String.Format("Error Processing Some Emails{0}{1}", vbCrLf, TrimToLength(tempLog.ToString, 2000)))
+                WriteToEventLog(TrimToLength(tempLog.ToString, 500), EventLogEntryType.Error)
+            End If
+        Catch ex As Exception
+            EmailObjectManager.AddLogItem(String.Format("ERROR{0}{1}", vbCrLf, ex.ToString))
+            SendMail("FATAL ERROR PROCESSING EMAILS(B)", String.Format("ERROR{0}{1}", vbCrLf, ex.ToString))
+            WriteToEventLog(String.Format("FATAL ERROR PROCESSING EMAILS(B){0}{1}", vbCrLf, ex.ToString), EventLogEntryType.Error)
+        End Try
+    End Sub
+
+    Public Function TrimToLength(ByVal s As String, ByVal MaxLength As Integer) As String
+        If s.Length > MaxLength Then
+            Return s.Substring(0, MaxLength)
+        Else
+            Return s
+        End If
+    End Function
+
+    Private Sub ForwardEmail(ByVal SendTo As String, ByVal Body As String, ByVal temail As EmailMessage2)
+        Dim mClient As New SmtpClient
+        Dim newMessage As New MailMessage
+        Dim sb As New System.Text.StringBuilder
+        Dim ms As New IO.MemoryStream
+        'get the mime data for the email.
+        temail.EmailMessage.Load(New Microsoft.Exchange.WebServices.Data.PropertySet(Microsoft.Exchange.WebServices.Data.ItemSchema.MimeContent))
+        ms.Write(temail.EmailMessage.MimeContent.Content, 0, temail.EmailMessage.MimeContent.Content.Length)
+        'reload the intial email
+        temail.LoadAllAttachments()
+        mClient.Host = "mail.tagtmi.com"
+        newMessage.Subject = "FW: " & temail.GetSubject
+        newMessage.Body = Body
+        'do not access anything other than the MimeContent after loading it.  If you need something else, you will have to reload the main message again.. by Design Microsoft
+        For Each s As String In SendTo.Split(";")
+            Try
+                newMessage.To.Add(New MailAddress(s))
+            Catch ex As Exception
+                'incorrectly formatted email address
+            End Try
+        Next
+        ms.Seek(0, SeekOrigin.Begin)
+        newMessage.Attachments.Add(New System.Net.Mail.Attachment(ms, "Forward.eml"))
+        newMessage.From = New MailAddress(temail.GetTo)
+        mClient.Send(newMessage)
+    End Sub
+
+    Private Sub SendMail(ByVal SendTo As String, ByVal Subject As String, ByVal Body As String)
+        Try
+            If sEmailTo IsNot Nothing Then
+                Dim mClient As New SmtpClient
+                Dim newMessage As New MailMessage
+                mClient.Host = "mail.tagtmi.com"
+                newMessage.Subject = Subject
+                newMessage.Body = Body
+                For Each s As String In SendTo.Split(";")
+                    Try
+                        newMessage.To.Add(New MailAddress(s))
+                    Catch ex As Exception
+                        'incorrectly formatted email address
+                    End Try
+                Next
+                newMessage.From = New MailAddress("EmailImport.no-reply@DELL.com")
+                mClient.Send(newMessage)
+            End If
+        Catch ex As Exception
+            WriteToEventLog(ex.ToString, EventLogEntryType.Error)
+        End Try
+    End Sub
+
+    Private Sub SendMail(ByVal Subject As String, ByVal Body As String)
+        Try
+            If sEmailTo IsNot Nothing Then
+                Dim mClient As New SmtpClient
+                Dim newMessage As New MailMessage
+                mClient.Host = "mail.tagtmi.com"
+                newMessage.Subject = Subject
+                newMessage.Body = Body
+                For Each s As String In sEmailTo.Split(";")
+                    Try
+                        newMessage.To.Add(New MailAddress(s))
+                    Catch ex As Exception
+                        'incorrectly formatted email address
+                    End Try
+                Next
+                newMessage.From = New MailAddress("EmailImport.no-reply@DELL.com")
+                mClient.Send(newMessage)
+            End If
+        Catch ex As Exception
+            WriteToEventLog(ex.ToString, EventLogEntryType.Error)
+        End Try
+    End Sub
+
+    Public Function WriteToEventLog(ByVal Message As String, ByVal MessageType As EventLogEntryType)
+        Try
+            EventLog.WriteEntry(Message, MessageType)
+            Return True
+        Catch Ex As Exception
+            Return False
+        End Try
+    End Function
+    Public Function FixPath(ByVal Path As String) As String
+        Return String.Format("{0}{1}", Path, IIf(Path.EndsWith("\"), "", "\"))
+    End Function
+
+    Public Sub New()
+
+        ' This call is required by the Windows Form Designer.
+        InitializeComponent()
+
+        ' Add any initialization after the InitializeComponent() call.
+
+    End Sub
+End Class
+
+Public Class EmailSettingManager
+    Public Property emailAddress As String
+    Public Property suspendedUntil As Date
+    Public Property connectivityErrors As Integer
+    Public Property serverErrors As Integer
+    Public Property suspendedReason As String
+    Public Property emailVersionErrors As Integer
+    Public Property serviceVersion As Microsoft.Exchange.WebServices.Data.ExchangeVersion = Microsoft.Exchange.WebServices.Data.ExchangeVersion.Exchange2010_SP1
+    Public Property serviceLocation As String
+
+    Public Sub ResetCounters()
+        connectivityErrors = 0
+        serverErrors = 0
+        emailVersionErrors = 0
+    End Sub
+
+    Public Sub New(EmailAddress As String)
+        Me.emailAddress = EmailAddress
+        Me.suspendedUntil = Now.AddDays(-1)
+    End Sub
+End Class
+
+Public Class EmailSettingManagerList
+    Inherits List(Of EmailSettingManager)
+
+    Public Property findByEmailAddress(EmailAddress As String) As EmailSettingManager
+        Get
+            For i As Integer = 0 To Me.Count - 1
+                If Item(i).emailAddress = EmailAddress Then
+                    Return Item(i)
+                End If
+            Next
+            Return Nothing
+        End Get
+        Set(value As EmailSettingManager)
+            For i As Integer = 0 To Me.Count - 1
+                If Item(i).emailAddress = EmailAddress Then
+                    Item(i) = value
+                End If
+            Next
+        End Set
+    End Property
+End Class
+
+
+Public Class OAuthCredentials
+    Implements ICredentials
+
+    Private ReadOnly _accessToken As String
+
+    Public Sub New(ByVal accessToken As String)
+        _accessToken = accessToken
+    End Sub
+
+
+    Public Function GetCredential(uri As Uri, authType As String) As NetworkCredential Implements ICredentials.GetCredential
+        Return New NetworkCredential(String.Empty, _accessToken)
+    End Function
+End Class
